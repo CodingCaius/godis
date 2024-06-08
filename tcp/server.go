@@ -10,14 +10,17 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/CodingCaius/godis/interface/tcp"
+	"github.com/CodingCaius/godis/lib/logger"
 )
 
 // tcp 服务器
 
 type Config struct {
 	Address    string        `yaml:"address"`
-	MaxConnect uint32        `yaml:"max-connect`
-	Timeout    time.Duration `yaml:"timeout`
+	MaxConnect uint32        `yaml:"max-connect"`
+	Timeout    time.Duration `yaml:"timeout"`
 }
 
 // 客户端连接计数
