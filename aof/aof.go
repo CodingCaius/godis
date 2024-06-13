@@ -2,13 +2,16 @@ package aof
 
 import (
 	"context"
+	"io"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/CodingCaius/godis/interface/database"
 	"github.com/CodingCaius/godis/lib/logger"
+	"github.com/CodingCaius/godis/redis/parser"
 	"github.com/CodingCaius/godis/redis/protocol"
 )
 
@@ -59,7 +62,7 @@ type Persister struct {
 	// 暂停 aof 以开始/完成 aof 重写进度
 	pausingAof sync.Mutex
 	// 当前活动数据库
-	currentDB  int
+	currentDB int
 	// 存储当前所有活跃的监听器
 	listeners map[Listener]struct{}
 	// 重用cmdLine缓冲区
@@ -181,11 +184,10 @@ func (persister *Persister) writeAof(p *payload) {
 	}
 }
 
-
 // LoadAof 用于读取 AOF（Append Only File）文件，并在启动 Persister.listenCmd 之前加载其中的命令
 func (persister *Persister) LoadAof(maxBytes int) {
-	// persister.db.Exec may call persister.AddAof
-	// delete aofChan to prevent loaded commands back into aofChan
+	// persister.db.Exec 可能会调用 persister.AddAof
+	//删除 aofChan 以防止加载的命令返回到 aofChan
 	aofChan := persister.aofChan
 	persister.aofChan = nil
 	defer func(aofChan chan *payload) {
@@ -250,4 +252,43 @@ func (persister *Persister) LoadAof(maxBytes int) {
 			}
 		}
 	}
+}
+
+// Fsync 将 aof 文件刷新到磁盘
+func (persister *Persister) Fsync() {
+	persister.pausingAof.Lock()
+	if err := persister.aofFile.Sync(); err != nil {
+		logger.Errorf("fsync failed: %v", err)
+	}
+	persister.pausingAof.Unlock()
+}
+
+// Close 优雅地停止 aof 持久化过程
+func (persister *Persister) Close() {
+	if persister.aofFile != nil {
+		close(persister.aofChan)
+		<-persister.aofFinished // wait for aof finished
+		err := persister.aofFile.Close()
+		if err != nil {
+			logger.Warn(err)
+		}
+	}
+	persister.cancel()
+}
+
+// fsyncEverySecond fsync aof file every second
+func (persister *Persister) fsyncEverySecond() {
+	// 创建了一个新的 Ticker，每秒钟触发一次
+	// 它会按照指定的时间间隔向其 C 通道发送时间戳
+	ticker := time.NewTicker(time.Second)
+	go func() {
+		for {
+			select {
+			case <-ticker.C:
+				persister.Fsync()
+			case <-persister.ctx.Done():
+				return
+			}
+		}
+	}()
 }
