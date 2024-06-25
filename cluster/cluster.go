@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	"github.com/CodingCaius/godis/config"
+	database2 "github.com/CodingCaius/godis/database"
 	"github.com/CodingCaius/godis/datastruct/dict"
 	"github.com/CodingCaius/godis/datastruct/set"
 	"github.com/CodingCaius/godis/interface/database"

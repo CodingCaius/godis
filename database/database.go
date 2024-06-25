@@ -1,4 +1,6 @@
 package database
+// 包database是一个兼容redis接口的内存数据库实现
+// 这里是数据库接口的具体实现
 
 import (
 	"strings"
