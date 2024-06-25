@@ -9,7 +9,7 @@ const (
 	prime32 = uint32(16777619)
 )
 
-// Locks provides rw locks for key
+// Locks 为 key 提供读写锁
 type Locks struct {
 	table []*sync.RWMutex
 }
