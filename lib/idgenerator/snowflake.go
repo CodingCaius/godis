@@ -25,26 +25,30 @@ const (
 	timeLeft    uint8 = 22
 	// 节点 ID 在生成的 ID 中左移的位数
 	nodeLeft    uint8 = 10
-	// 用于生成节点 ID 的掩码
+	// 用于生成节点 ID 的掩码  4095  2^12 - 1
 	nodeMask    int64 = -1 ^ (-1 << uint64(timeLeft-nodeLeft))
 )
 
-// IDGenerator generates unique uint64 ID using snowflake algorithm
+// IDGenerator使用雪花算法生成唯一的 uint64 ID
 type IDGenerator struct {
 	mu        *sync.Mutex
-	lastStamp int64
-	nodeID    int64
-	sequence  int64
-	epoch     time.Time
+	lastStamp int64 // 上一次生成 ID 的时间戳
+	nodeID    int64 // 节点 ID，用于区分不同的生成器实例
+	sequence  int64 // 序列号，用于在同一毫秒内生成多个唯一 ID
+	epoch     time.Time // 起始时间戳
 }
 
-// MakeGenerator creates a new IDGenerator
+// MakeGenerator 创建一个新的 IDGenerator
 func MakeGenerator(node string) *IDGenerator {
+	// 创建一个 FNV-1 64 位哈希函数实例
 	fnv64 := fnv.New64()
+	// 将节点字符串写入哈希函数
 	_, _ = fnv64.Write([]byte(node))
+	// 计算节点 ID，并使用掩码确保其在合法范围内
 	nodeID := int64(fnv64.Sum64()) & nodeMask
 
 	var curTime = time.Now()
+	// 计算当前时间与起始时间戳的差值
 	epoch := curTime.Add(time.Unix(epoch0/1000, (epoch0%1000)*1000000).Sub(curTime))
 
 	return &IDGenerator{
@@ -56,17 +60,24 @@ func MakeGenerator(node string) *IDGenerator {
 	}
 }
 
-// NextID returns next unique ID
+// NextID 返回下一个唯一 ID
+// 时间戳部分： 42 位
+// 节点 ID 部分： 10 位
+// 序列号部分： 10 位
 func (w *IDGenerator) NextID() int64 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	// 计算当前时间戳，单位为毫秒
 	timestamp := time.Since(w.epoch).Nanoseconds() / 1000000
+	// 如果当前时间戳小于上一次生成 ID 的时间戳，说明系统时钟回退，无法生成 ID
 	if timestamp < w.lastStamp {
 		log.Fatal("can not generate id")
 	}
+	// 如果当前时间戳与上一次相同，增加序列号。
 	if w.lastStamp == timestamp {
 		w.sequence = (w.sequence + 1) & maxSequence
+		// 如果序列号达到最大值，等待下一个毫秒。
 		if w.sequence == 0 {
 			for timestamp <= w.lastStamp {
 				timestamp = time.Since(w.epoch).Nanoseconds() / 1000000
@@ -76,6 +87,7 @@ func (w *IDGenerator) NextID() int64 {
 		w.sequence = 0
 	}
 	w.lastStamp = timestamp
+	// 生成唯一 ID，包含时间戳、节点 ID 和序列号
 	id := (timestamp << timeLeft) | (w.nodeID << nodeLeft) | w.sequence
 	//fmt.Printf("%d %d %d\n", timestamp, w.sequence, id)
 	return id
