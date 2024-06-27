@@ -1,4 +1,12 @@
 // cluster 包提供了对客户端透明的服务器端集群，你可以连接到集群中的任何节点来访问集群中的所有数据
+
+/*
+实现了一个分布式 Redis 集群节点的核心功能，
+包括节点的初始化、命令执行、事务处理、槽位管理、客户端连接管理等。
+通过这些功能，客户端可以透明地访问集群中的所有数据，而不需要关心数据具体存储在哪个节点上。
+*/
+
+
 package cluster
 
 import (
@@ -15,6 +23,7 @@ import (
 	"github.com/CodingCaius/godis/datastruct/set"
 	"github.com/CodingCaius/godis/interface/database"
 	"github.com/CodingCaius/godis/interface/redis"
+	"github.com/CodingCaius/godis/lib/idgenerator"
 	"github.com/CodingCaius/godis/lib/logger"
 	"github.com/CodingCaius/godis/redis/parser"
 	"github.com/CodingCaius/godis/redis/protocol"
@@ -67,12 +76,15 @@ type clientFactory interface {
 }
 
 const (
+	// 这个槽位的主要数据存储在这个节点上
 	slotStateHost      = iota // 表示当前节点是槽位的主机
+	// 当前节点正在从其他节点导入这个槽位的数据
 	slotStateImporting        // 表示当前节点正在导入槽位
+	// 当前节点正在将这个槽位的数据迁移到其他节点
 	slotStateMovingOut        // 表示当前节点正在迁出槽位
 )
 
-// hostSlot 存储当前节点托管的主机的状态
+
 // 表示当前节点负责的槽位状态
 type hostSlot struct {
 	// 槽位状态，可以是 slotStateHost、slotStateImporting 或 slotStateMovingOut
