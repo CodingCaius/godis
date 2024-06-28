@@ -37,7 +37,7 @@ type DBEngine interface {
 	SetKeyDeletedCallback(cb KeyEventCallback)
 }
 
-// DataEntity stores data bound to a key, including a string, list, hash, set and so on
+// DataEntityDataEntity 存储与某个键绑定的数据，包括字符串、列表、散列、集合等
 type DataEntity struct {
 	Data interface{}
 }

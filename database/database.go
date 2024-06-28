@@ -2,6 +2,9 @@ package database
 // 包database是一个兼容redis接口的内存数据库实现
 // 这里是数据库接口的具体实现
 
+// 实现了一个内存数据库，提供了与Redis兼容的接口。
+// 它支持基本的数据存储和检索功能，并提供了事务控制、过期时间管理、版本管理和并发控制等高级功能。
+
 import (
 	"strings"
 
@@ -133,4 +136,98 @@ func (db *DB) execNormalCommand(cmdLine [][]byte) redis.Reply {
 	// 获取并执行命令的执行函数
 	fun := cmd.executor
 	return fun(db, cmdLine[1:])
+}
+
+// execWithLock 执行普通命令，调用者应该提供锁
+func (db *DB) execWithLock(cmdLine [][]byte) redis.Reply {
+	cmdName := strings.ToLower(string(cmdLine[0]))
+	cmd, ok := cmdTable[cmdName]
+	if !ok {
+		return protocol.MakeErrReply("ERR unknown command '" + cmdName + "'")
+	}
+	if !validateArity(cmd.arity, cmdLine) {
+		return protocol.MakeArgNumErrReply(cmdName)
+	}
+	fun := cmd.executor
+	return fun(db, cmdLine[1:])
+}
+
+// 验证命令的参数数量是否正确
+func validateArity(arity int, cmdArgs [][]byte) bool {
+	argNum := len(cmdArgs)
+	if arity >= 0 {
+		return argNum == arity
+	}
+	return argNum >= -arity
+}
+
+/* ---- 增删改查 ----- */
+// 通过使用带锁的方式，这些操作可以在多线程环境中安全地执行
+
+// GetEntity 获取与给定键绑定的数据实体
+func (db *DB) GetEntity(key string) (*database.DataEntity, bool) {
+	raw, ok := db.data.GetWithLock(key)
+	if !ok {
+		return nil, false
+	}
+	if db.IsExpired(key) {
+		return nil, false
+	}
+	entity, _ := raw.(*database.DataEntity)
+	return entity, true
+}
+
+// PutEntity a DataEntity into DB
+func (db *DB) PutEntity(key string, entity *database.DataEntity) int {
+	ret := db.data.PutWithLock(key, entity)
+	// db.insertCallback may be set as nil, during `if` and actually callback
+	// so introduce a local variable `cb`
+	if cb := db.insertCallback; ret > 0 && cb != nil {
+		cb(db.index, key, entity)
+	}
+	return ret
+}
+
+// PutIfExists edit an existing DataEntity
+func (db *DB) PutIfExists(key string, entity *database.DataEntity) int {
+	return db.data.PutIfExistsWithLock(key, entity)
+}
+
+// PutIfAbsent insert an DataEntity only if the key not exists
+func (db *DB) PutIfAbsent(key string, entity *database.DataEntity) int {
+	ret := db.data.PutIfAbsentWithLock(key, entity)
+	// db.insertCallback may be set as nil, during `if` and actually callback
+	// so introduce a local variable `cb`
+	if cb := db.insertCallback; ret > 0 && cb != nil {
+		cb(db.index, key, entity)
+	}
+	return ret
+}
+
+// Remove the given key from db
+func (db *DB) Remove(key string) {
+	raw, deleted := db.data.RemoveWithLock(key)
+	db.ttlMap.Remove(key)
+	taskKey := genExpireTask(key)
+	timewheel.Cancel(taskKey)
+	if cb := db.deleteCallback; cb != nil {
+		var entity *database.DataEntity
+		if deleted > 0 {
+			entity = raw.(*database.DataEntity)
+		}
+		cb(db.index, key, entity)
+	}
+}
+
+// Removes the given keys from db
+func (db *DB) Removes(keys ...string) (deleted int) {
+	deleted = 0
+	for _, key := range keys {
+		_, exists := db.data.GetWithLock(key)
+		if exists {
+			db.Remove(key)
+			deleted++
+		}
+	}
+	return deleted
 }
