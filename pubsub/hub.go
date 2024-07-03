@@ -5,6 +5,7 @@ import (
 	"github.com/CodingCaius/godis/datastruct/lock"
 )
 
+// 管理所有频道和订阅者的核心结构
 // Hub stores all subscribe relations
 type Hub struct {
 	// channel -> list(*Client)
