@@ -18,6 +18,7 @@ import (
 	"github.com/CodingCaius/godis/interface/redis"
 	"github.com/CodingCaius/godis/lib/logger"
 	"github.com/CodingCaius/godis/lib/utils"
+	"github.com/CodingCaius/godis/pubsub"
 	"github.com/CodingCaius/godis/redis/protocol"
 )
 
@@ -347,7 +348,6 @@ func (server *Server) RWUnLocks(dbIndex int, writeKeys []string, readKeys []stri
 func (server *Server) GetUndoLogs(dbIndex int, cmdLine [][]byte) []CmdLine {
 	return server.mustSelectDB(dbIndex).GetUndoLogs(cmdLine)
 }
-
 
 // ExecWithLock 执行带锁的普通命令，调用者应提供锁
 func (server *Server) ExecWithLock(conn redis.Connection, cmdLine [][]byte) redis.Reply {
