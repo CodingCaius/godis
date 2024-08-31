@@ -1,19 +1,30 @@
 package database
 
+// 实现了一个功能齐全的 Redis 服务器，支持多数据库、持久化、复制、发布/订阅等功能。
+// 它通过定义 Server 结构体和一系列方法，提供了对 Redis 命令的处理和数据库操作的支持
+
 import (
 	"fmt"
 	"os"
+	"runtime/debug"
+	"strconv"
+	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/CodingCaius/godis/aof"
 	"github.com/CodingCaius/godis/config"
 	"github.com/CodingCaius/godis/interface/database"
+	"github.com/CodingCaius/godis/interface/redis"
 	"github.com/CodingCaius/godis/lib/logger"
+	"github.com/CodingCaius/godis/lib/utils"
+	"github.com/CodingCaius/godis/pubsub"
+	"github.com/CodingCaius/godis/redis/protocol"
 )
 
 var godisVersion = "1.2.8"
 
-// Server 是一个redis服务器，支持多数据库, rdb 加载，aof持久化, 主从复制等能力
+// Server 是一个redis服务器，支持多数据库, rdb 加载，aof持久化, 复制等能力
 type Server struct {
 	dbSet []*atomic.Value // 一个包含多个数据库的切片，每个数据库是一个 *atomic.Value 类型的指针，指向 *DB
 
@@ -24,9 +35,9 @@ type Server struct {
 
 	// for replication
 	// 表示服务器的角色（主节点或从节点）
-	role         int32
+	role int32
 	// 从节点的状态
-	slaveStatus  *slaveStatus
+	slaveStatus *slaveStatus
 	// 主节点的状态
 	masterStatus *masterStatus
 
@@ -204,4 +215,253 @@ func (server *Server) Exec(c redis.Connection, cmdLine [][]byte) (result redis.R
 		return errReply
 	}
 	return selectedDB.Exec(c, cmdLine)
+}
+
+// AfterClientClose 客户端关闭连接后进行一些清理
+func (server *Server) AfterClientClose(c redis.Connection) {
+	// 取消客户端 c 订阅的所有频道
+	pubsub.UnsubscribeAll(server.hub, c)
+}
+
+// Close 优雅关闭数据库
+func (server *Server) Close() {
+	// 停止从节点状态
+	server.slaveStatus.close()
+	// 如果服务器有持久化机制（server.persister 不为 nil），则调用其 Close 方法关闭持久化机制
+	if server.persister != nil {
+		server.persister.Close()
+	}
+	// 停止主节点的相关操作
+	server.stopMaster()
+}
+
+// 处理 SELECT 命令，用于选择数据库
+func execSelect(c redis.Connection, mdb *Server, args [][]byte) redis.Reply {
+	dbIndex, err := strconv.Atoi(string(args[0]))
+	if err != nil {
+		return protocol.MakeErrReply("ERR invalid DB index")
+	}
+	if dbIndex >= len(mdb.dbSet) || dbIndex < 0 {
+		return protocol.MakeErrReply("ERR DB index is out of range")
+	}
+	c.SelectDB(dbIndex)
+	return protocol.MakeOkReply()
+}
+
+// 清空指定的数据库
+func (server *Server) execFlushDB(dbIndex int) redis.Reply {
+	if server.persister != nil {
+		server.persister.SaveCmdLine(dbIndex, utils.ToCmdLine("FlushDB"))
+	}
+	return server.flushDB(dbIndex)
+}
+
+// flushDB flushes the selected database
+func (server *Server) flushDB(dbIndex int) redis.Reply {
+	if dbIndex >= len(server.dbSet) || dbIndex < 0 {
+		return protocol.MakeErrReply("ERR DB index is out of range")
+	}
+	newDB := makeDB()
+	server.loadDB(dbIndex, newDB)
+	return &protocol.OkReply{}
+}
+
+func (server *Server) loadDB(dbIndex int, newDB *DB) redis.Reply {
+	if dbIndex >= len(server.dbSet) || dbIndex < 0 {
+		return protocol.MakeErrReply("ERR DB index is out of range")
+	}
+	oldDB := server.mustSelectDB(dbIndex)
+	newDB.index = dbIndex
+	newDB.addAof = oldDB.addAof // inherit oldDB
+	server.dbSet[dbIndex].Store(newDB)
+	return &protocol.OkReply{}
+}
+
+// flushAll flushes all databases.
+func (server *Server) flushAll() redis.Reply {
+	for i := range server.dbSet {
+		server.flushDB(i)
+	}
+	if server.persister != nil {
+		server.persister.SaveCmdLine(0, utils.ToCmdLine("FlushAll"))
+	}
+	return &protocol.OkReply{}
+}
+
+// selectDB returns the database with the given index, or an error if the index is out of range.
+func (server *Server) selectDB(dbIndex int) (*DB, *protocol.StandardErrReply) {
+	if dbIndex >= len(server.dbSet) || dbIndex < 0 {
+		return nil, protocol.MakeErrReply("ERR DB index is out of range")
+	}
+	return server.dbSet[dbIndex].Load().(*DB), nil
+}
+
+// MustSelectDB 与 selectDB 类似，但如果发生错误，则会出现恐慌
+func (server *Server) mustSelectDB(dbIndex int) *DB {
+	selectedDB, err := server.selectDB(dbIndex)
+	if err != nil {
+		panic(err)
+	}
+	return selectedDB
+}
+
+// ForEach 遍历指定数据库中的所有键
+func (server *Server) ForEach(dbIndex int, cb func(key string, data *database.DataEntity, expiration *time.Time) bool) {
+	server.mustSelectDB(dbIndex).ForEach(cb)
+}
+
+// GetEntity 返回指定键对应的数据实体
+func (server *Server) GetEntity(dbIndex int, key string) (*database.DataEntity, bool) {
+	return server.mustSelectDB(dbIndex).GetEntity(key)
+}
+
+// 获取指定键的过期时间
+func (server *Server) GetExpiration(dbIndex int, key string) *time.Time {
+	raw, ok := server.mustSelectDB(dbIndex).ttlMap.Get(key)
+	if !ok {
+		return nil
+	}
+	expireTime, _ := raw.(time.Time)
+	return &expireTime
+}
+
+// ExecMulti 原子性和隔离性地执行多命令事务
+func (server *Server) ExecMulti(conn redis.Connection, watching map[string]uint32, cmdLines []CmdLine) redis.Reply {
+	selectedDB, errReply := server.selectDB(conn.GetDBIndex())
+	if errReply != nil {
+		return errReply
+	}
+	return selectedDB.ExecMulti(conn, watching, cmdLines)
+}
+
+// RWLocks lock keys for writing and reading
+func (server *Server) RWLocks(dbIndex int, writeKeys []string, readKeys []string) {
+	server.mustSelectDB(dbIndex).RWLocks(writeKeys, readKeys)
+}
+
+// RWUnLocks unlock keys for writing and reading
+func (server *Server) RWUnLocks(dbIndex int, writeKeys []string, readKeys []string) {
+	server.mustSelectDB(dbIndex).RWUnLocks(writeKeys, readKeys)
+}
+
+// GetUndoLogs 返回回滚命令
+func (server *Server) GetUndoLogs(dbIndex int, cmdLine [][]byte) []CmdLine {
+	return server.mustSelectDB(dbIndex).GetUndoLogs(cmdLine)
+}
+
+// ExecWithLock 执行带锁的普通命令，调用者应提供锁
+func (server *Server) ExecWithLock(conn redis.Connection, cmdLine [][]byte) redis.Reply {
+	db, errReply := server.selectDB(conn.GetDBIndex())
+	if errReply != nil {
+		return errReply
+	}
+	return db.execWithLock(cmdLine)
+}
+
+// BGRewriteAOF 异步重写 AOF 文件
+func BGRewriteAOF(db *Server, args [][]byte) redis.Reply {
+	go db.persister.Rewrite()
+	return protocol.MakeStatusReply("Background append only file rewriting started")
+}
+
+// RewriteAOF 同步重写 AOF 文件，直到完成
+func RewriteAOF(db *Server, args [][]byte) redis.Reply {
+	err := db.persister.Rewrite()
+	if err != nil {
+		return protocol.MakeErrReply(err.Error())
+	}
+	return protocol.MakeOkReply()
+}
+
+// SaveRDB 同步保存 RDB 文件，直到完成
+func SaveRDB(db *Server, args [][]byte) redis.Reply {
+	if db.persister == nil {
+		return protocol.MakeErrReply("please enable aof before using save")
+	}
+	rdbFilename := config.Properties.RDBFilename
+	if rdbFilename == "" {
+		rdbFilename = "dump.rdb"
+	}
+	err := db.persister.GenerateRDB(rdbFilename)
+	if err != nil {
+		return protocol.MakeErrReply(err.Error())
+	}
+	return protocol.MakeOkReply()
+}
+
+// BGSaveRDB 异步保存 RDB 文件
+func BGSaveRDB(db *Server, args [][]byte) redis.Reply {
+	if db.persister == nil {
+		return protocol.MakeErrReply("please enable aof before using save")
+	}
+	go func() {
+		defer func() {
+			if err := recover(); err != nil {
+				logger.Error(err)
+			}
+		}()
+		rdbFilename := config.Properties.RDBFilename
+		if rdbFilename == "" {
+			rdbFilename = "dump.rdb"
+		}
+		err := db.persister.GenerateRDB(rdbFilename)
+		if err != nil {
+			logger.Error(err)
+		}
+	}()
+	return protocol.MakeStatusReply("Background saving started")
+}
+
+// GetDBSize 指定数据库的键数量和 TTL 键数量
+func (server *Server) GetDBSize(dbIndex int) (int, int) {
+	db := server.mustSelectDB(dbIndex)
+	return db.data.Len(), db.ttlMap.Len()
+}
+
+// 启动复制定时任务，每 10 秒执行一次
+func (server *Server) startReplCron() {
+	go func(mdb *Server) {
+		ticker := time.Tick(time.Second * 10)
+		for range ticker {
+			mdb.slaveCron()
+			mdb.masterCron()
+		}
+	}(server)
+}
+
+// GetAvgTTL 计算指定数据库中键的平均过期时间
+func (server *Server) GetAvgTTL(dbIndex, randomKeyCount int) int64 {
+	var ttlCount int64
+	db := server.mustSelectDB(dbIndex)
+	keys := db.data.RandomKeys(randomKeyCount)
+	for _, k := range keys {
+		t := time.Now()
+		rawExpireTime, ok := db.ttlMap.Get(k)
+		if !ok {
+			continue
+		}
+		expireTime, _ := rawExpireTime.(time.Time)
+		// if the key has already reached its expiration time during calculation, ignore it
+		if expireTime.Sub(t).Microseconds() > 0 {
+			ttlCount += expireTime.Sub(t).Microseconds()
+		}
+	}
+	return ttlCount / int64(len(keys))
+}
+
+func (server *Server) SetKeyInsertedCallback(cb database.KeyEventCallback) {
+	server.insertCallback = cb
+	for i := range server.dbSet {
+		db := server.mustSelectDB(i)
+		db.insertCallback = cb
+	}
+
+}
+
+func (server *Server) SetKeyDeletedCallback(cb database.KeyEventCallback) {
+	server.deleteCallback = cb
+	for i := range server.dbSet {
+		db := server.mustSelectDB(i)
+		db.deleteCallback = cb
+	}
 }
